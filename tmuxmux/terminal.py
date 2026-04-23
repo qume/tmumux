@@ -330,6 +330,25 @@ class TerminalPane(Widget, can_focus=True):
         event.stop()
         event.prevent_default()
 
+    async def on_paste(self, event) -> None:  # type: ignore[override]
+        """Forward bracketed-paste content into the PTY.
+
+        Textual absorbs the outer terminal's `ESC[200~ … ESC[201~` into a
+        single Paste event, so `on_key` never sees it. Re-wrap and write so
+        the inner shell / vim / tmux treats it as an atomic paste rather
+        than a burst of keystrokes.
+        """
+        if not self._alive or self._fd is None:
+            return
+        payload = "\x1b[200~" + event.text + "\x1b[201~"
+        try:
+            os.write(self._fd, payload.encode("utf-8", errors="replace"))
+        except OSError:
+            self._on_exited()
+            return
+        event.stop()
+        event.prevent_default()
+
     # ----------------------------------------------------------------- external
 
     @property
