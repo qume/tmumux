@@ -1,0 +1,26 @@
+# tmuxmux host list. Copy this file to `hosts.toml` and edit for your machines.
+# The app looks for `./hosts.toml` first, then `~/.config/tmuxmux/hosts.toml`.
+
+# --- Local ---
+# Skip ssh entirely and run tmux against the machine tmuxmux is running on.
+[[hosts]]
+name = "localhost"
+local = true
+
+# --- Plain ssh ---
+# Anything ssh can resolve: alias from ~/.ssh/config, FQDN, or IP.
+# Uses your ssh-agent / keys; no credentials stored here.
+[[hosts]]
+name = "bots"
+# username = "alice"   # optional; omitted uses the local user / ~/.ssh/config
+
+# --- Custom command ---
+# Provide the full shell invocation that opens the login session, up to (but
+# not including) the remote command. Must include `-tt` so `tmux attach` gets
+# a remote pty. Handy for sshpass, cloudflared ProxyCommand, etc.
+# Note: anything you paste here is in plaintext — consider whether you want
+# that file in your backup / dotfiles.
+#
+# [[hosts]]
+# name = "my-app"
+# command = "sshpass -p hunter2 ssh -tt -o ProxyCommand='cloudflared access ssh --hostname app.example.com' dev@app.example.com"

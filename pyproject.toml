@@ -1,0 +1,19 @@
+[project]
+name = "tmuxmux"
+version = "0.1.0"
+description = "Textual TUI that tabs between tmux sessions across SSH hosts"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.80",
+    "pyte>=0.8.2",
+]
+
+[project.scripts]
+tmuxmux = "tmuxmux.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tmuxmux*"]
