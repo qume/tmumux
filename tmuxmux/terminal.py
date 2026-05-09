@@ -52,9 +52,16 @@ class TerminalPane(Widget, can_focus=True):
             super().__init__()
             self.pane = pane
 
-    def __init__(self, cmd_factory: CommandFactory, *, id: str | None = None) -> None:
+    def __init__(
+        self,
+        cmd_factory: CommandFactory,
+        *,
+        id: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(id=id)
         self._cmd_factory = cmd_factory
+        self._env_overrides = dict(env) if env else {}
         self._pid: int | None = None
         self._fd: int | None = None
         self._screen: pyte.Screen | None = None
@@ -84,6 +91,11 @@ class TerminalPane(Widget, can_focus=True):
         cols = max(self.size.width or 80, 2)
         rows = max(self.size.height or 24, 2)
         self._screen = pyte.Screen(cols, rows)
+        # Enable Line Feed / Newline Mode so a bare `\n` from the remote acts
+        # as `\r\n` (move to col 0 + down). xterm's default has this off and
+        # pyte mirrors that — but ssh into a remote tmux often strips the CR,
+        # leaving output offset from / overprinting the prompt line.
+        self._screen.set_mode(pyte.modes.LNM)
         self._stream = pyte.Stream(self._screen)
         # pyte treats UTF-8 mode as authoritative and skips `ESC(0` charset
         # switches, which breaks tmux's box-drawing (chars come through as
@@ -95,12 +107,19 @@ class TerminalPane(Widget, can_focus=True):
         cmd = self._cmd_factory()
         pid, fd = pty.fork()
         if pid == 0:
-            # Child: exec the command with a sensible TERM.
+            # Child: default to xterm-256color, but let the user override via
+            # config (per-host or global env). Inner TUIs that confuse pyte
+            # often render better under TERM=xterm or with NO_COLOR=1.
             os.environ["TERM"] = "xterm-256color"
             # If the user launched us from inside tmux, $TMUX is inherited —
             # and `tmux attach` refuses to nest without --force. Strip it.
             for var in ("TMUX", "TMUX_PANE"):
                 os.environ.pop(var, None)
+            for k, v in self._env_overrides.items():
+                if v == "":
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             try:
                 os.execvp(cmd[0], cmd)
             except Exception:
