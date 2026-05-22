@@ -4,6 +4,7 @@ import asyncio
 import shlex
 from dataclasses import dataclass
 
+from ._log import log
 from .config import Host
 
 
@@ -38,6 +39,7 @@ def _base_argv(host: Host) -> list[str]:
 async def list_sessions(host: Host, timeout: float = 15.0) -> SessionList:
     """Run `ssh <host> tmux ls` (or just `tmux ls` for local) and parse names."""
     cmd = _base_argv(host) + ["tmux", "ls"]
+    log("list_sessions({}): argv={!r}", host.name, cmd)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -49,12 +51,19 @@ async def list_sessions(host: Host, timeout: float = 15.0) -> SessionList:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
+            log("list_sessions({}): TIMEOUT after {}s", host.name, timeout)
             return SessionList(host, (), error="timeout")
     except FileNotFoundError:
+        log("list_sessions({}): ssh not installed", host.name)
         return SessionList(host, (), error="ssh not installed")
 
     if proc.returncode != 0:
-        msg = stderr.decode(errors="replace").strip().splitlines()
+        stderr_text = stderr.decode(errors="replace").strip()
+        log(
+            "list_sessions({}): exit={} stderr={!r}",
+            host.name, proc.returncode, stderr_text,
+        )
+        msg = stderr_text.splitlines()
         # tmux prints "no server running on ..." when there are zero sessions —
         # treat that as an empty list rather than an error.
         if any("no server running" in line for line in msg):
@@ -67,6 +76,7 @@ async def list_sessions(host: Host, timeout: float = 15.0) -> SessionList:
         if not line or ":" not in line:
             continue
         sessions.append(line.split(":", 1)[0])
+    log("list_sessions({}): ok, sessions={}", host.name, sessions)
     return SessionList(host, tuple(sessions))
 
 
@@ -76,11 +86,20 @@ def attach_command(host: Host, session: str) -> list[str]:
     For plain ssh we inject `-t` so the remote command gets a pty. For
     user-provided commands we assume they included `-tt` themselves. For
     local hosts we just exec tmux directly.
+
+    Manual hosts use `tmux new-session -A` (attach-or-create) with cwd
+    `~/<session>` — these boxes restart often and we want a click on a
+    "no sessions" leaf to spin tmux back up, not error. The `-c` cwd is
+    ignored when the session already exists; the remote login shell expands
+    the `~` for us. Plain hosts keep plain `attach` since they're usually
+    long-lived infra where a missing session is a real signal.
     """
     if host.local:
         return ["tmux", "attach", "-t", session]
     if host.command:
-        return _base_argv(host) + ["tmux", "attach", "-t", session]
+        return _base_argv(host) + [
+            "tmux", "new-session", "-A", "-s", session, "-c", f"~/{session}",
+        ]
     return [
         "ssh",
         *SSH_OPTS,

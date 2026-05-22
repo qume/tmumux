@@ -13,6 +13,7 @@ from textual.widgets import ContentSwitcher, Footer, Header, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from . import ssh
+from ._log import install_excepthook, log
 from .config import Config, Host
 from .terminal import TerminalPane
 
@@ -34,6 +35,7 @@ class TmuxmuxApp(App):
     CSS = """
     Screen { layout: horizontal; }
     #sidebar { width: 34; border-right: solid $primary; }
+    #sidebar.-collapsed { display: none; }
     #main { width: 1fr; }
     Tree { padding: 0 1; }
     #placeholder { padding: 2; color: $text-muted; content-align: center middle; }
@@ -42,12 +44,15 @@ class TmuxmuxApp(App):
     BINDINGS = [
         Binding("ctrl+right_square_bracket", "next_session", "Next", priority=True),
         Binding("ctrl+backslash", "prev_session", "Prev", priority=True),
+        Binding("f2", "toggle_sidebar", "Sidebar", priority=True),
         Binding("f5", "refresh", "Refresh"),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        install_excepthook()
+        log("=== tmuxmux start, {} host(s) ===", len(config.hosts))
         self.config = config
         self._order: list[SessionKey] = []
         self._hosts_by_name: dict[str, Host] = {h.name: h for h in config.hosts}
@@ -155,8 +160,12 @@ class TmuxmuxApp(App):
             label, data = f"{host.name}  [red]! {result.error}[/red]", host
             self._update_in_place(ours, label, data)
         elif not result.sessions:
-            label, data = f"{host.name}  [dim](no sessions)[/dim]", host
-            self._update_in_place(ours, label, data)
+            # Box probably restarted and tmux isn't running. Make the leaf
+            # clickable: attach_command for a manual host uses
+            # `tmux new-session -A` so this attaches if the session exists
+            # or creates a fresh `<host.name>` session in `~/<host.name>`.
+            label = f"{host.name}  [dim](start)[/dim]"
+            self._update_in_place(ours, label, SessionKey(host.name, host.name))
         elif len(result.sessions) == 1:
             s = result.sessions[0]
             self._update_in_place(ours, host.name, SessionKey(host.name, s))
@@ -223,6 +232,15 @@ class TmuxmuxApp(App):
         # Enter / click: commit the current session and drop focus into the
         # pane so the user can start typing immediately.
         data = event.node.data
+        log("node_selected: data={!r} label={!r}", data, str(event.node.label))
+        if isinstance(data, Host) and data.command:
+            # Manual host leaf clicked before its `tmux ls` resolved (the
+            # `(…)` loading state still has `data=host`). Treat it as a
+            # request for the canonical `<host>/<host>` session — the manual
+            # attach_command uses `new-session -A`, so this attaches if one
+            # already exists and otherwise creates a fresh session in
+            # `~/<host>`. Without this the click is a no-op during startup.
+            data = SessionKey(data.name, data.name)
         if isinstance(data, SessionKey):
             await self._ensure_mounted(data)
             pane = self._switcher.get_child_by_id(data.pane_id)
@@ -244,6 +262,23 @@ class TmuxmuxApp(App):
 
     def action_refresh(self) -> None:
         self.run_worker(self._refresh_all(), exclusive=False)
+
+    def action_toggle_sidebar(self) -> None:
+        if self._tree is None:
+            return
+        self._tree.toggle_class("-collapsed")
+        # Move focus sensibly: hand it to the current pane when hiding (so the
+        # user can start typing right away), back to the tree when showing.
+        if self._tree.has_class("-collapsed"):
+            if self._current is not None and self._switcher is not None:
+                try:
+                    pane = self._switcher.get_child_by_id(self._current.pane_id)
+                except NoMatches:
+                    return
+                if isinstance(pane, TerminalPane):
+                    pane.focus()
+        else:
+            self._tree.focus()
 
     def _cycle(self, delta: int) -> None:
         """Move the tree cursor — NodeHighlighted will do the activation."""
@@ -283,18 +318,24 @@ class TmuxmuxApp(App):
     async def _ensure_mounted(self, key: SessionKey) -> None:
         """Make the pane for `key` the current one, mounting it if needed."""
         assert self._switcher is not None
+        log("ensure_mounted: key={!r} pane_id={!r}", key, key.pane_id)
         try:
             pane = self._switcher.get_child_by_id(key.pane_id)
+            log("  pane exists, reusing")
         except NoMatches:
             host = self._hosts_by_name[key.host_name]
+            log("  mounting new pane for host={!r}", host.name)
 
             def factory(h: Host = host, s: str = key.session) -> list[str]:
-                return ssh.attach_command(h, s)
+                argv = ssh.attach_command(h, s)
+                log("  factory built argv: {!r}", argv)
+                return argv
 
             pane = TerminalPane(factory, id=key.pane_id)
             await self._switcher.mount(pane)
         self._switcher.current = key.pane_id
         if isinstance(pane, TerminalPane):
+            log("  ensure_alive(); alive_before={}", pane.is_alive)
             pane.ensure_alive()
         self._current = key
 

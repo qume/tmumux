@@ -16,7 +16,9 @@ import pty
 import signal
 import struct
 import termios
-from typing import Callable
+import time
+from pathlib import Path
+from typing import Callable, IO
 
 import pyte
 from rich.segment import Segment
@@ -24,6 +26,8 @@ from rich.style import Style
 from textual.message import Message
 from textual.strip import Strip
 from textual.widget import Widget
+
+from ._log import log
 
 
 CommandFactory = Callable[[], list[str]]
@@ -67,8 +71,10 @@ class TerminalPane(Widget, can_focus=True):
         self._screen: pyte.Screen | None = None
         self._stream: pyte.Stream | None = None
         self._decoder: codecs.IncrementalDecoder | None = None
+        self._last_was_cr = False
         self._alive = False
         self._ever_spawned = False
+        self._dump_fh: IO[bytes] | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -76,10 +82,17 @@ class TerminalPane(Widget, can_focus=True):
         """Lazy-spawn on first reveal; reconnect if the process had died.
 
         Focus is managed by the app — don't grab it here or arrow-key preview
-        in the sidebar breaks.
+        in the sidebar breaks. Note we only spawn once Textual has actually
+        sized us; otherwise pyte boots at 80×24 (fallback) and the remote
+        tmux's later resize+diff-redraw skips "should be blank" cells via
+        `ESC[C`, leaving stale chars from the smaller layout visible in the
+        gaps between words.
         """
-        if not self._alive:
+        if not self._alive and self._has_real_size():
             self._spawn()
+
+    def _has_real_size(self) -> bool:
+        return bool(self.size.width and self.size.height)
 
     def on_unmount(self) -> None:
         self._teardown()
@@ -88,15 +101,14 @@ class TerminalPane(Widget, can_focus=True):
 
     def _spawn(self) -> None:
         self._teardown()
-        cols = max(self.size.width or 80, 2)
-        rows = max(self.size.height or 24, 2)
+        cols = max(self.size.width, 2)
+        rows = max(self.size.height, 2)
+        log("spawn({}): size={}x{}", self.id, cols, rows)
         self._screen = pyte.Screen(cols, rows)
-        # Enable Line Feed / Newline Mode so a bare `\n` from the remote acts
-        # as `\r\n` (move to col 0 + down). xterm's default has this off and
-        # pyte mirrors that — but ssh into a remote tmux often strips the CR,
-        # leaving output offset from / overprinting the prompt line.
-        self._screen.set_mode(pyte.modes.LNM)
         self._stream = pyte.Stream(self._screen)
+        # Track whether the previous chunk ended on `\r`, so a `\r\n` split
+        # across reads doesn't get a spurious extra CR inserted.
+        self._last_was_cr = False
         # pyte treats UTF-8 mode as authoritative and skips `ESC(0` charset
         # switches, which breaks tmux's box-drawing (chars come through as
         # literal `q`/`x`/`j`/…). Turn UTF-8 mode off on the stream; we decode
@@ -105,6 +117,7 @@ class TerminalPane(Widget, can_focus=True):
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         cmd = self._cmd_factory()
+        log("spawn({}): argv={!r}", self.id, cmd)
         pid, fd = pty.fork()
         if pid == 0:
             # Child: default to xterm-256color, but let the user override via
@@ -120,6 +133,19 @@ class TerminalPane(Widget, can_focus=True):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            # Set the pty size BEFORE exec so ssh's TIOCGWINSZ on startup
+            # reads the right dimensions. If we leave this to the parent's
+            # post-fork TIOCSWINSZ, there's a race where ssh queries 0×0 and
+            # the remote pty (and tmux) start at a default size that doesn't
+            # match what we tell pyte.
+            try:
+                fcntl.ioctl(
+                    0,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0),
+                )
+            except OSError:
+                pass
             try:
                 os.execvp(cmd[0], cmd)
             except Exception:
@@ -130,6 +156,7 @@ class TerminalPane(Widget, can_focus=True):
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         self._set_winsize(rows, cols)
+        self._open_dump(cmd, rows, cols)
 
         # pyte may want to write back (e.g. reply to device-status queries).
         def _reply(data: str) -> None:
@@ -144,6 +171,7 @@ class TerminalPane(Widget, can_focus=True):
 
         self._alive = True
         self._ever_spawned = True
+        log("spawn({}): pid={} fd={} alive", self.id, pid, fd)
         loop = asyncio.get_event_loop()
         loop.add_reader(fd, self._on_read)
         # Seed the screen with a status line so the user sees *something* even
@@ -152,6 +180,54 @@ class TerminalPane(Widget, can_focus=True):
         banner = f"starting: {' '.join(cmd)}\r\n"
         self._stream.feed(banner)
         self.refresh()
+
+    def _open_dump(self, cmd: list[str], rows: int, cols: int) -> None:
+        """If TMUXMUX_DUMP is set, capture raw bytes (and timing) from the PTY.
+
+        Format: a binary file per session. Each record is:
+          `\\x1bDUMP<dir><len:4 big-endian><payload>`
+        where <dir> is `R` (read, PTY→us) or `W` (write, us→PTY). The leading
+        ESC + literal "DUMP" makes the file invalid as a terminal stream, so
+        you don't accidentally cat it; payload bytes are the raw PTY data.
+        Read with the matching demux tool (see _dump_replay.py — yet to write).
+        """
+        dump_dir = os.environ.get("TMUXMUX_DUMP")
+        if not dump_dir:
+            return
+        try:
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            ident = (self.id or "pane").replace("/", "_")
+            path = Path(dump_dir) / f"{stamp}-{ident}-{self._pid}.dump"
+            fh = open(path, "wb")
+        except OSError:
+            return
+        self._dump_fh = fh
+        header = f"# tmuxmux dump\n# cmd={' '.join(cmd)}\n# rows={rows} cols={cols}\n"
+        try:
+            fh.write(header.encode("utf-8"))
+            fh.flush()
+        except OSError:
+            pass
+
+    def _dump(self, direction: str, payload: bytes) -> None:
+        if self._dump_fh is None:
+            return
+        rec = b"\x1bDUMP" + direction.encode("ascii") + len(payload).to_bytes(4, "big") + payload
+        try:
+            self._dump_fh.write(rec)
+            self._dump_fh.flush()
+        except OSError:
+            pass
+
+    def _close_dump(self) -> None:
+        if self._dump_fh is None:
+            return
+        try:
+            self._dump_fh.close()
+        except OSError:
+            pass
+        self._dump_fh = None
 
     def _teardown(self) -> None:
         if self._fd is not None:
@@ -175,6 +251,7 @@ class TerminalPane(Widget, can_focus=True):
                 pass
             self._pid = None
         self._alive = False
+        self._close_dump()
 
     def _set_winsize(self, rows: int, cols: int) -> None:
         if self._fd is None:
@@ -203,16 +280,38 @@ class TerminalPane(Widget, can_focus=True):
         if not data:
             self._on_exited()
             return
+        self._dump("R", data)
         try:
             text = self._decoder.decode(data)
             if text:
-                self._stream.feed(text)
+                self._stream.feed(self._normalize_newlines(text))
         except Exception:
             # pyte is generally robust, but never crash the app on a bad byte.
             pass
         self.refresh()
 
+    def _normalize_newlines(self, text: str) -> str:
+        """Promote bare `\\n` to `\\r\\n` so we don't staircase.
+
+        Pyte's LNM mode does this too, but apps can toggle it off (RIS, DECSTR,
+        explicit `ESC[20l`) and tmux puts the remote pty in raw mode so the
+        usual ONLCR translation never happens. Doing it here means nothing
+        downstream can undo it.
+        """
+        out: list[str] = []
+        prev_cr = self._last_was_cr
+        for ch in text:
+            if ch == "\n" and not prev_cr:
+                out.append("\r\n")
+                prev_cr = False
+            else:
+                out.append(ch)
+                prev_cr = ch == "\r"
+        self._last_was_cr = prev_cr
+        return "".join(out)
+
     def _on_exited(self) -> None:
+        log("pane({}): on_exited", self.id)
         if not self._alive and self._fd is None and self._pid is None:
             return
         self._teardown()
@@ -228,10 +327,34 @@ class TerminalPane(Widget, can_focus=True):
     def on_resize(self, event) -> None:  # type: ignore[override]
         cols = max(event.size.width, 2)
         rows = max(event.size.height, 2)
+        # First real size after on_show couldn't spawn (size was 0×0). Spawn
+        # now so pyte and the remote pty agree on dimensions from the start.
+        if not self._alive and self._has_real_size():
+            self._spawn()
+            return
         if self._screen is not None:
             self._screen.resize(rows, cols)
+            # Pyte's resize keeps the old cell contents in-place. The remote
+            # tmux, after its SIGWINCH-driven redraw, diffs against an
+            # all-blank frame and emits `ESC[C` over cells it considers
+            # unchanged spaces — which would re-expose any stale chars sitting
+            # in pyte's old buffer. Wipe the buffer so tmux's redraw lands on
+            # a clean slate and the two views stay in sync.
+            self._clear_screen_buffer()
         self._set_winsize(rows, cols)
         self.refresh()
+
+    def _clear_screen_buffer(self) -> None:
+        """Erase visible cells without resetting screen modes / cursor."""
+        scr = self._screen
+        if scr is None:
+            return
+        # `\x1b[2J` clears the entire display; routed through pyte's stream
+        # so we don't reach into internals.
+        if self._stream is not None:
+            self._stream.feed("\x1b[2J")
+        else:
+            scr.erase_in_display(2)
 
     # ------------------------------------------------------------------- render
 
@@ -346,6 +469,7 @@ class TerminalPane(Widget, can_focus=True):
         except OSError:
             self._on_exited()
             return
+        self._dump("W", data)
         event.stop()
         event.prevent_default()
 
@@ -360,11 +484,13 @@ class TerminalPane(Widget, can_focus=True):
         if not self._alive or self._fd is None:
             return
         payload = "\x1b[200~" + event.text + "\x1b[201~"
+        payload_bytes = payload.encode("utf-8", errors="replace")
         try:
-            os.write(self._fd, payload.encode("utf-8", errors="replace"))
+            os.write(self._fd, payload_bytes)
         except OSError:
             self._on_exited()
             return
+        self._dump("W", payload_bytes)
         event.stop()
         event.prevent_default()
 
@@ -375,8 +501,14 @@ class TerminalPane(Widget, can_focus=True):
         return self._alive
 
     def ensure_alive(self) -> None:
-        """Respawn the process if it has exited. Safe to call when already alive."""
+        """Respawn the process if it has exited. Safe to call when already alive.
+
+        Only spawns when we already know our real size — otherwise pyte and the
+        remote pty would start at the 2×2 floor (since self.size is (0,0) right
+        after mount) and never fully recover. `on_resize` picks up the spawn
+        once layout assigns a real size.
+        """
         if self._alive:
             return
-        # on_show may have fired before size was known; spawn now.
-        self._spawn()
+        if self._has_real_size():
+            self._spawn()
